@@ -20,7 +20,7 @@ def load_cifar(center=False):
     train_batches = []
     train_labels = []
     for i in range(1,6):
-        cifar_out = unpickle("./cifar/data_batch_{0}".format(i))
+        cifar_out = unpickle("../cifar/data_batch_{0}".format(i))
         train_batches.append(cifar_out["data"])
         train_labels.extend(cifar_out["labels"])
 
@@ -29,7 +29,7 @@ def load_cifar(center=False):
     X_train = X_train.reshape(-1,3,32,32)
     mean_image = np.mean(X_train, axis=0)[np.newaxis, :, :]
     y_train = np.array(train_labels)
-    cifar_out = unpickle("./cifar/test_batch")
+    cifar_out = unpickle("../cifar/test_batch")
     X_test = cifar_out["data"].reshape(-1, 32*32, 3)
     X_test = X_test.reshape(-1,3,32,32)
     X_train = X_train
@@ -63,20 +63,17 @@ def conv(data, feature_batch_size, num_feature_batches, data_batch_size):
                 XBlock = conv_op(XBlock, FTheano)
 
                 # RELU
-                XBlock1 = T.nnet.relu(XBlock, 0)
+                XBlock0 = T.nnet.relu(XBlock, 0)
                 XBlock1 = T.nnet.relu(-1.0 * XBlock, 0)
 
-
-                XBlock = XBlock1
-
                 # MAX POOL
-                pool_op = MaxPool(ds=13, stride=13)
+                pool_op = MaxPool(ds=14, stride=14)
 
-                XBlock = pool_op(XBlock)
+                XBlock0 = pool_op(XBlock0)
                 XBlock1 = pool_op(XBlock1)
 
                 # evaluation
-                XBlockOut = np.concatenate((XBlock.eval(), XBlock1.eval()), axis=0)
+                XBlockOut = np.concatenate((XBlock0.eval(), XBlock1.eval()), axis=0)
                 out.append(XBlockOut)
         outX.append(np.concatenate(out, axis=3))
     XFinal = np.concatenate(outX, axis=0)
@@ -86,13 +83,13 @@ if __name__ == "__main__":
     # Load CIFAR
     (XTrain, yTrain), (XTest, yTest) = load_cifar()
     X = np.vstack((XTrain, XTest))
-    
+
     # Convert to cuda-convnet order
     X = X.transpose(1,2,3,0)
 
     NUM_FEATURE_BATCHES=1
-    DATA_BATCH_SIZE=1280
-    FEATURE_BATCH_SIZE=1024
+    DATA_BATCH_SIZE=(1280)
+    FEATURE_BATCH_SIZE=(1024)
 
     conv(X, FEATURE_BATCH_SIZE, NUM_FEATURE_BATCHES, DATA_BATCH_SIZE)
 
