@@ -5,7 +5,11 @@ from pylearn2.sandbox.cuda_convnet.pool import MaxPool
 from theano.sandbox.cuda.basic_ops import gpu_contiguous
 import logging
 import numpy as np
+import scipy.linalg
+from sklearn import metrics
 import time
+
+from sklearn.metrics import accuracy_score
 
 #logging.getLogger('theano.gof.cmodule').setLevel(logging.DEBUG)
 
@@ -38,7 +42,7 @@ def load_cifar(center=False):
     return (X_train, np.array(y_train)), (X_test, np.array(y_test))
 
 
-def conv(data, feature_batch_size, num_feature_batches, data_batch_size, cuda_convnet=True):
+def conv(data, feature_batch_size, num_feature_batches, data_batch_size, cuda_convnet=True, bandwidth=0.01, symmetric_relu=True):
     outX = []
     filters = []
     numImages = data.shape[0]
@@ -49,7 +53,7 @@ def conv(data, feature_batch_size, num_feature_batches, data_batch_size, cuda_co
 
     XTheano = shared(data.astype('float32'), borrow=True)
     for j in range(num_feature_batches):
-        F = np.random.randn(feature_batch_size, 3, 6, 6).astype('float32')
+        F = np.random.randn(feature_batch_size, 3, 6, 6).astype('float32') * bandwidth
         if (cuda_convnet):
             F = F.transpose(1,2,3,0)
 
@@ -79,7 +83,8 @@ def conv(data, feature_batch_size, num_feature_batches, data_batch_size, cuda_co
 
                 # RELU
                 XBlock0 = T.nnet.relu(XBlock, 0)
-                XBlock1 = T.nnet.relu(-1.0 * XBlock, 0)
+                if (symmetric_relu):
+                    XBlock1 = T.nnet.relu(-1.0 * XBlock, 0)
 
                 # MAX POOL
                 if (cuda_convnet):
@@ -88,9 +93,12 @@ def conv(data, feature_batch_size, num_feature_batches, data_batch_size, cuda_co
                     pool_op = lambda X: T.signal.pool.pool_2d(X, (14, 14), ignore_border=False, mode='max')
 
                 XBlock0 = pool_op(XBlock0)
-                XBlock1 = pool_op(XBlock1)
+                if (symmetric_relu):
+                    XBlock1 = pool_op(XBlock1)
+                    XBlockOut = np.concatenate((XBlock0.eval(), XBlock1.eval()), axis=1)
+                else:
+                    XBlockOut = np.array(XBlock0.eval())
 
-                XBlockOut = np.concatenate((XBlock0.eval(), XBlock1.eval()), axis=1)
                 if (cuda_convnet):
                     XBlockOut = XBlockOut.transpose(3,0,1,2)
                     F = F.transpose(3,0,1,2)
@@ -103,20 +111,124 @@ def conv(data, feature_batch_size, num_feature_batches, data_batch_size, cuda_co
 
     return (XFinal, filters)
 
+def preprocess(train, test, min_divisor=1e-8, zca_bias=0.1):
+    origTrainShape = train.shape
+    origTestShape = test.shape
+
+    train = np.ascontiguousarray(train, dtype=np.float32).reshape(train.shape[0], -1)
+    test = np.ascontiguousarray(test, dtype=np.float32).reshape(test.shape[0], -1)
+
+
+    print "PRE PROCESSING"
+    nTrain = train.shape[0]
+
+    # Zero mean every feature
+    train = train - np.mean(train, axis=1)[:,np.newaxis]
+    test = test - np.mean(test, axis=1)[:,np.newaxis]
+
+    # Normalize
+    train_norms = np.linalg.norm(train, axis=1)
+    test_norms = np.linalg.norm(test, axis=1)
+
+    # Get rid of really small norms
+    train_norms[np.where(train_norms < min_divisor)] = 1
+    test_norms[np.where(test_norms < min_divisor)] = 1
+
+    # Make features unit norm
+    train = train/train_norms[:,np.newaxis]
+    test = test/test_norms[:,np.newaxis]
+
+
+    whitening_means = np.mean(train, axis=0)
+    data_means = np.mean(train, axis=1)
+
+
+    zeroCenterTrain = (train - whitening_means[np.newaxis, :])
+
+    trainCovMat = 1.0/nTrain * zeroCenterTrain.T.dot(zeroCenterTrain)
+
+    (E,V) = np.linalg.eig(trainCovMat)
+
+    E += zca_bias
+    sqrt_zca_eigs = np.sqrt(E)
+    inv_sqrt_zca_eigs = np.diag(np.power(sqrt_zca_eigs, -1))
+    global_ZCA = V.dot(inv_sqrt_zca_eigs).dot(V.T)
+
+    train = (train - whitening_means).dot(global_ZCA)
+    test = (test - whitening_means).dot(global_ZCA)
+
+    return (train.reshape(origTrainShape), test.reshape(origTestShape))
+
+def learnPrimal(trainData, labels, reg=0.1):
+    '''Learn a model from trainData -> labels '''
+
+    trainData = trainData.reshape(trainData.shape[0],-1)
+
+    X = np.ascontiguousarray(trainData, dtype=np.float32).reshape(trainData.shape[0], -1)
+    print "X SHAPE ", trainData.shape
+    print "Computing XTX"
+    XTX = X.T.dot(X)
+    print "Done Computing XTX"
+
+    XTX += reg * np.eye(XTX.shape[0])
+
+
+    y = np.eye(max(labels) + 1)[labels]
+    XTy = X.T.dot(y)
+
+    print "Learning Primal Model"
+    model = scipy.linalg.solve(XTX, XTy)
+    return model
+
+def evaluatePrimalModel(data, model):
+    data = data.reshape(data.shape[0],-1)
+    yHat = np.argmax(data.dot(model), axis=1)
+    return yHat
+
+def trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest):
+    model = learnPrimal(XTrain, labelsTrain)
+    predTrainLabels = evaluatePrimalModel(XTrain, model)
+    predTestLabels = evaluatePrimalModel(XTest, model)
+
+    train_acc = metrics.accuracy_score(labelsTrain, predTrainLabels)
+
+    test_acc = metrics.accuracy_score(labelsTest, predTestLabels)
+    return train_acc, test_acc
+
+
+
+
 if __name__ == "__main__":
     # Load CIFAR
 
     NUM_FEATURE_BATCHES=1
     DATA_BATCH_SIZE=(1280)
     FEATURE_BATCH_SIZE=(1024)
+    NUM_TRAIN = 50000
+    NUM_TEST = 10000
     CUDA_CONVNET = True
 
-    (XTrain, yTrain), (XTest, yTest) = load_cifar()
+    np.random.seed(0)
+    (XTrain, labelsTrain), (XTest, labelsTest) = load_cifar()
+    rawTrainAcc, rawTestAcc = trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest)
+
+    print "(Raw) train: ", rawTrainAcc, "(Raw) test: ", rawTestAcc
+
+    (XTrain, XTest) =  preprocess(XTrain, XTest)
+
+    ppTrainAcc, ppTestAcc = trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest)
+    print "(pp) train: ", ppTrainAcc, "(pp) test: ", ppTestAcc
+
     X = np.vstack((XTrain, XTest))
+    (XFinal, filters) = conv(X, FEATURE_BATCH_SIZE, NUM_FEATURE_BATCHES, DATA_BATCH_SIZE, CUDA_CONVNET, symmetric_relu=False)
 
+    XFinalTrain = XFinal[:50000,:,:,:].reshape(NUM_TRAIN,-1)
+    XFinalTest = XFinal[50000:,:,:,:].reshape(NUM_TEST,-1)
 
-
-    (XFinal, filters) = conv(X, FEATURE_BATCH_SIZE, NUM_FEATURE_BATCHES, DATA_BATCH_SIZE, CUDA_CONVNET)
-    print "Output data shape ", XFinal.shape
+    print "Output train data shape ", XFinalTrain.shape
+    print "Output test data shape ", XFinalTest.shape
     print "Output filters shape ", filters.shape
+
+    convTrainAcc, convTestAcc = trainAndEvaluatePrimalModel(XFinalTrain, XFinalTest, labelsTrain, labelsTest)
+    print "(conv) train: ", convTrainAcc, "(conv) test: ", convTestAcc
 
