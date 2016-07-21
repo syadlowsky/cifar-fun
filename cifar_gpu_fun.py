@@ -3,7 +3,8 @@ import theano.tensor as T
 from pylearn2.sandbox.cuda_convnet.filter_acts import FilterActs
 from pylearn2.sandbox.cuda_convnet.pool import MaxPool
 from theano.sandbox.cuda.basic_ops import gpu_contiguous
-import multiprocessing
+from multiprocessing import Pipe
+import multiprocessing as mp
 from six.moves import cPickle
 import logging
 import numpy as np
@@ -11,7 +12,8 @@ import scipy.linalg
 from sklearn import metrics
 import time
 from multiprocessing import Process, Queue
-
+import numpy as np
+import SharedArray as sa
 from sklearn.metrics import accuracy_score
 
 #logging.getLogger('theano.gof.cmodule').setLevel(logging.DEBUG)
@@ -222,8 +224,8 @@ def trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest):
     return train_acc, test_acc
 
 def featurizeTrainAndEvaluateDualModel(XTrain, XTest, labelsTrain, labelsTest, num_feature_batches=1, solve_every_iter=1, reg=0.1):
-    trainKernel = np.zeros((XTrain.shape[0], XTrain.shape[0]))
-    testKernel= np.zeros((XTest.shape[0], XTrain.shape[0]))
+    trainKernel = np.zeros((XTrain.shape[0], XTrain.shape[0]),dtype='float32')
+    testKernel= np.zeros((XTest.shape[0], XTrain.shape[0]),dtype='float32')
     for i in range(1, (num_feature_batches + 1)):
         X = np.vstack((XTrain, XTest))
         print("Convolving features")
@@ -254,34 +256,59 @@ def featurizeTrainAndEvaluateDualModel(XTrain, XTest, labelsTrain, labelsTest, n
     return train_acc, test_acc
 
 def featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTest, num_feature_batches=1, solve_every_iter=1, reg=0.1):
-    conn = multiprocessing.Connection()
+    X = np.vstack((XTrain, XTest))
+    parent, child = Pipe()
+    sa.delete("shm://xbatch")
+    XBatchShared = sa.create("shm://xbatch", (X.shape[0],FEATURE_BATCH_SIZE*8), dtype='float32')
+    p = Process(target=accumulateGramAndSolveAsync, args=(child,XTrain.shape[0], XTest.shape[0], reg))
+    p.start()
+    child.close()
+
     for i in range(1, (num_feature_batches + 1)):
-        X = np.vstack((XTrain, XTest))
         print("Convolving features")
         time1 = time.time()
         (XBatch, filters) = conv(X, FEATURE_BATCH_SIZE, 1, DATA_BATCH_SIZE, CUDA_CONVNET, symmetric_relu=True, start_feature_batch=i-1)
         time2 = time.time()
         print 'Convolving features took {0} seconds'.format((time2-time1))
+        print("Sending features")
+        time1 = time.time()
+        np.copyto(XBatchShared, XBatch.reshape(XBatch.shape[0], -1))
+        parent.send(0)
+        print 'Sending features took {0} seconds'.format((time2-time1))
+        time2 = time.time()
+    print("CLOSING CONNECTION")
+    parent.send(-1)
+    parent.close()
 
-def accumulateGramAndSolve(pipe, numTrain, numTest):
-    trainKernel = np.zeros((numTrain, numTrain))
-    testKernel= np.zeros((numTest, numTrain))
-    try:
-        while(True):
-            (XBatch, filters) = pipe.recv()
-            XBatchTrain = XBatch[:50000,:,:,:].reshape(NUM_TRAIN,-1)
-            XBatchTest = XBatch[50000:,:,:,:].reshape(NUM_TEST,-1)
-            print("Accumulating Gram")
-            time1 = time.time()
-            trainKernel += XBatchTrain.dot(XBatchTrain.T)
-            testKernel += XBatchTest.dot(XBatchTrain.T)
-            time2 = time.time()
-            print 'Accumulating gram took {0} seconds'.format((time2-time1))
-    except EOFError as e:
+def accumulateGramAndSolveAsync(pipe, numTrain, numTest, reg):
+    trainKernel = np.zeros((numTrain, numTrain), dtype='float32')
+    testKernel= np.zeros((numTest, numTrain), dtype='float32')
+    XBatchShared = sa.attach("shm://xbatch")
+    # Local copy
+    XBatchLocal = np.zeros(XBatchShared.shape, dtype='float32')
+    print("CHILD Process Spun")
+    while(True):
+        m = pipe.recv()
+        if m == -1:
+            break
+        time1 = time.time()
+        print("Receiving (ASYNC) Gram")
+        np.copyto(XBatchLocal, XBatchShared)
+        time2 = time.time()
+        print 'Receiving (ASYNC) took {0} seconds'.format((time2-time1))
+        XBatchTrain = XBatchLocal[:50000,:]
+        XBatchTest = XBatchLocal[50000:,:]
+        print("XBATCH DTYPE " + str(XBatchTest.dtype))
+        print("Accumulating (ASYNC) Gram")
+        time1 = time.time()
+        trainKernel += XBatchTrain.dot(XBatchTrain.T)
+        testKernel += XBatchTest.dot(XBatchTrain.T)
+        time2 = time.time()
+        print 'Accumulating (ASYNC) gram took {0} seconds'.format((time2-time1))
     time1 = time.time()
     model = learnDual(trainKernel, labelsTrain, reg)
     time2 = time.time()
-    print 'learningDual took {0} seconds'.format((time2-time1))
+    print 'learningDual (ASYNC) took {0} seconds'.format((time2-time1))
     predTrainLabels = evaluateDualModel(trainKernel, model)
     predTestLabels = evaluateDualModel(testKernel, model)
     print("true shape " + str(labelsTrain.shape))
@@ -291,20 +318,10 @@ def accumulateGramAndSolve(pipe, numTrain, numTest):
     print "(async dual conv) train: , {convTrainAcc}, (dual conv batch) test: {convTestAcc}".format(convTrainAcc=train_acc, convTestAcc=test_acc)
     return train_acc, test_acc
 
-def timing(f):
-    def wrap(*args):
-        time1 = time.time()
-        ret = f(*args)
-        time2 = time.time()
-        print '%s function took %0.3f ms' % (f.func_name, (time2-time1)*1000.0)
-        return ret
-    return wrap
-
-
 if __name__ == "__main__":
     # Load CIFAR
 
-    NUM_FEATURE_BATCHES=20
+    NUM_FEATURE_BATCHES=1
     DATA_BATCH_SIZE=(1280+256)
     FEATURE_BATCH_SIZE=(1024)
     NUM_TRAIN = 50000
@@ -329,7 +346,7 @@ if __name__ == "__main__":
     print "(conv) train: ", convTrainAcc, "(conv) test: ", convTestAcc
     '''
 
-    featurizeTrainAndEvaluateDualModel(XTrain, XTest, labelsTrain, labelsTest, num_feature_batches=NUM_FEATURE_BATCHES, solve_every_iter=NUM_FEATURE_BATCHES)
+    featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTest, num_feature_batches=NUM_FEATURE_BATCHES, solve_every_iter=NUM_FEATURE_BATCHES)
 
     '''
 
