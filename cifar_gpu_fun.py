@@ -3,11 +3,14 @@ import theano.tensor as T
 from pylearn2.sandbox.cuda_convnet.filter_acts import FilterActs
 from pylearn2.sandbox.cuda_convnet.pool import MaxPool
 from theano.sandbox.cuda.basic_ops import gpu_contiguous
+import multiprocessing
+from six.moves import cPickle
 import logging
 import numpy as np
 import scipy.linalg
 from sklearn import metrics
 import time
+from multiprocessing import Process, Queue
 
 from sklearn.metrics import accuracy_score
 
@@ -19,6 +22,10 @@ def unpickle(infile):
     outdict = cPickle.load(fo)
     fo.close()
     return outdict
+
+def load_cifar_processed():
+    npzfile = np.load("./cifar_processed")
+    return (npzfile['XTrain'], npzfile['yTrain']), (npzfile['XTest'], npzfile['yTest'])
 
 def load_cifar(center=False):
     train_batches = []
@@ -42,49 +49,49 @@ def load_cifar(center=False):
     return (X_train, np.array(y_train)), (X_test, np.array(y_test))
 
 
-def conv(data, feature_batch_size, num_feature_batches, data_batch_size, cuda_convnet=True, bandwidth=0.01, symmetric_relu=True):
+def conv(data, feature_batch_size, num_feature_batches, data_batch_size, cuda_convnet=True, bandwidth=0.01, symmetric_relu=True, start_feature_batch=0):
     outX = []
     filters = []
     numImages = data.shape[0]
+    data = data.astype('float32')
 
     # Convert to cuda-convnet order
     if (cuda_convnet):
         data = data.transpose(1,2,3,0)
 
-    XTheano = shared(data.astype('float32'), borrow=True)
+    #XTheano = shared(data.astype('float32'))
     for j in range(num_feature_batches):
         F = np.random.randn(feature_batch_size, 3, 6, 6).astype('float32') * bandwidth
         if (cuda_convnet):
             F = F.transpose(1,2,3,0)
 
         filters.append(F)
-        FTheano = shared(F.astype('float32'), borrow=True)
+        FTheano = shared(F.astype('float32'))
         out = []
         for i in range(int(np.ceil(numImages/float(data_batch_size)))):
                 start = i*data_batch_size
                 end = min((i+1)*data_batch_size, numImages)
-
-                print "FEATURE BATCH #", j, "DATA BATCH #", i,  " SIZE IS ", end - start
+                print "FEATURE BATCH #", (j + start_feature_batch), "DATA BATCH #", i,  " SIZE IS ", end - start
                 if (cuda_convnet):
-                    XBlock = XTheano[:, :, :, start:end]
+                    XBlock = shared(data[:, :, :, start:end])
                 else:
-                    XBlock = XTheano[start:end, :, :, :]
+                    XBlock = shared(data[start:end, :, :, :])
 
                 if (cuda_convnet):
                     conv_op = FilterActs()
                     # Turn into continigious chunk for theano
-                    XBlock = gpu_contiguous(XBlock)
-                    FTheano = gpu_contiguous(FTheano)
+                    XBlock_gpu = gpu_contiguous(XBlock)
+                    FTheano_gpu = gpu_contiguous(FTheano)
                 else:
                     conv_op = lambda X, F: T.nnet.conv2d(X, F)
 
                 # CONV
-                XBlock = conv_op(XBlock, FTheano)
+                XBlock_conv_out = conv_op(XBlock_gpu, FTheano_gpu)
 
                 # RELU
-                XBlock0 = T.nnet.relu(XBlock, 0)
+                XBlock0 = T.nnet.relu(XBlock_conv_out, 0)
                 if (symmetric_relu):
-                    XBlock1 = T.nnet.relu(-1.0 * XBlock, 0)
+                    XBlock1 = T.nnet.relu(-1.0 * XBlock_conv_out, 0)
 
                 # MAX POOL
                 if (cuda_convnet):
@@ -103,7 +110,10 @@ def conv(data, feature_batch_size, num_feature_batches, data_batch_size, cuda_co
                     XBlockOut = XBlockOut.transpose(3,0,1,2)
                     F = F.transpose(3,0,1,2)
 
+                XBlock.set_value([[[[]]]])
                 out.append(XBlockOut)
+
+        FTheano.set_value([[[[]]]])
         outX.append(np.concatenate(out, axis=0))
 
     XFinal = np.concatenate(outX, axis=1)
@@ -180,55 +190,149 @@ def learnPrimal(trainData, labels, reg=0.1):
     model = scipy.linalg.solve(XTX, XTy)
     return model
 
+def learnDual(gramMatrix, labels, reg=0.1):
+    ''' Learn a model from K matrix -> labels '''
+    print ("Learning Dual Model")
+    y = np.eye(max(labels) + 1)[labels]
+    model = scipy.linalg.solve(gramMatrix + reg * np.eye(gramMatrix.shape[0]), y)
+    print model.shape
+    return model
+
 def evaluatePrimalModel(data, model):
     data = data.reshape(data.shape[0],-1)
     yHat = np.argmax(data.dot(model), axis=1)
     return yHat
 
+
+def evaluateDualModel(kMatrix, model):
+    print("MODEL SHAPE " + str(model.shape))
+    print("KERNEL SHAPE " + str(kMatrix.shape))
+    y = kMatrix.dot(model)
+    print("pred SHAPE " + str(y.shape))
+    yHat = np.argmax(y, axis=1)
+    return yHat
+
+
 def trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest):
     model = learnPrimal(XTrain, labelsTrain)
     predTrainLabels = evaluatePrimalModel(XTrain, model)
     predTestLabels = evaluatePrimalModel(XTest, model)
-
     train_acc = metrics.accuracy_score(labelsTrain, predTrainLabels)
-
     test_acc = metrics.accuracy_score(labelsTest, predTestLabels)
     return train_acc, test_acc
 
+def featurizeTrainAndEvaluateDualModel(XTrain, XTest, labelsTrain, labelsTest, num_feature_batches=1, solve_every_iter=1, reg=0.1):
+    trainKernel = np.zeros((XTrain.shape[0], XTrain.shape[0]))
+    testKernel= np.zeros((XTest.shape[0], XTrain.shape[0]))
+    for i in range(1, (num_feature_batches + 1)):
+        X = np.vstack((XTrain, XTest))
+        print("Convolving features")
+        time1 = time.time()
+        (XBatch, filters) = conv(X, FEATURE_BATCH_SIZE, 1, DATA_BATCH_SIZE, CUDA_CONVNET, symmetric_relu=True, start_feature_batch=i-1)
+        time2 = time.time()
+        print 'Convolving features took {0} seconds'.format((time2-time1))
+        XBatchTrain = XBatch[:50000,:,:,:].reshape(NUM_TRAIN,-1)
+        XBatchTest = XBatch[50000:,:,:,:].reshape(NUM_TEST,-1)
+        print("Accumulating Gram")
+        time1 = time.time()
+        trainKernel += XBatchTrain.dot(XBatchTrain.T)
+        testKernel += XBatchTest.dot(XBatchTrain.T)
+        time2 = time.time()
+        print 'Accumulating gram took {0} seconds'.format((time2-time1))
+        if ((i % solve_every_iter == 0) or i == num_feature_batches - 1):
+            time1 = time.time()
+            model = learnDual(trainKernel, labelsTrain, reg)
+            time2 = time.time()
+            print 'learningDual took {0} seconds'.format((time2-time1))
+            predTrainLabels = evaluateDualModel(trainKernel, model)
+            predTestLabels = evaluateDualModel(testKernel, model)
+            print("true shape " + str(labelsTrain.shape))
+            print("pred shape " + str(predTrainLabels.shape))
+            train_acc = metrics.accuracy_score(labelsTrain, predTrainLabels)
+            test_acc = metrics.accuracy_score(labelsTest, predTestLabels)
+            print "(dual conv #{batchNo}) train: , {convTrainAcc}, (dual conv batch #{batchNo}) test: {convTestAcc}".format(batchNo=i, convTrainAcc=train_acc, convTestAcc=test_acc)
+    return train_acc, test_acc
 
+def featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTest, num_feature_batches=1, solve_every_iter=1, reg=0.1):
+    conn = multiprocessing.Connection()
+    for i in range(1, (num_feature_batches + 1)):
+        X = np.vstack((XTrain, XTest))
+        print("Convolving features")
+        time1 = time.time()
+        (XBatch, filters) = conv(X, FEATURE_BATCH_SIZE, 1, DATA_BATCH_SIZE, CUDA_CONVNET, symmetric_relu=True, start_feature_batch=i-1)
+        time2 = time.time()
+        print 'Convolving features took {0} seconds'.format((time2-time1))
+
+def accumulateGramAndSolve(pipe, numTrain, numTest):
+    trainKernel = np.zeros((numTrain, numTrain))
+    testKernel= np.zeros((numTest, numTrain))
+    try:
+        while(True):
+            (XBatch, filters) = pipe.recv()
+            XBatchTrain = XBatch[:50000,:,:,:].reshape(NUM_TRAIN,-1)
+            XBatchTest = XBatch[50000:,:,:,:].reshape(NUM_TEST,-1)
+            print("Accumulating Gram")
+            time1 = time.time()
+            trainKernel += XBatchTrain.dot(XBatchTrain.T)
+            testKernel += XBatchTest.dot(XBatchTrain.T)
+            time2 = time.time()
+            print 'Accumulating gram took {0} seconds'.format((time2-time1))
+    except EOFError as e:
+    time1 = time.time()
+    model = learnDual(trainKernel, labelsTrain, reg)
+    time2 = time.time()
+    print 'learningDual took {0} seconds'.format((time2-time1))
+    predTrainLabels = evaluateDualModel(trainKernel, model)
+    predTestLabels = evaluateDualModel(testKernel, model)
+    print("true shape " + str(labelsTrain.shape))
+    print("pred shape " + str(predTrainLabels.shape))
+    train_acc = metrics.accuracy_score(labelsTrain, predTrainLabels)
+    test_acc = metrics.accuracy_score(labelsTest, predTestLabels)
+    print "(async dual conv) train: , {convTrainAcc}, (dual conv batch) test: {convTestAcc}".format(convTrainAcc=train_acc, convTestAcc=test_acc)
+    return train_acc, test_acc
+
+def timing(f):
+    def wrap(*args):
+        time1 = time.time()
+        ret = f(*args)
+        time2 = time.time()
+        print '%s function took %0.3f ms' % (f.func_name, (time2-time1)*1000.0)
+        return ret
+    return wrap
 
 
 if __name__ == "__main__":
     # Load CIFAR
 
-    NUM_FEATURE_BATCHES=1
-    DATA_BATCH_SIZE=(1280)
+    NUM_FEATURE_BATCHES=20
+    DATA_BATCH_SIZE=(1280+256)
     FEATURE_BATCH_SIZE=(1024)
     NUM_TRAIN = 50000
     NUM_TEST = 10000
     CUDA_CONVNET = True
 
     np.random.seed(0)
-    (XTrain, labelsTrain), (XTest, labelsTest) = load_cifar()
-    rawTrainAcc, rawTestAcc = trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest)
+    (XTrain, labelsTrain), (XTest, labelsTest) = load_cifar_processed()
 
-    print "(Raw) train: ", rawTrainAcc, "(Raw) test: ", rawTestAcc
-
-    (XTrain, XTest) =  preprocess(XTrain, XTest)
-
-    ppTrainAcc, ppTestAcc = trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest)
-    print "(pp) train: ", ppTrainAcc, "(pp) test: ", ppTestAcc
-
+    '''
     X = np.vstack((XTrain, XTest))
-    (XFinal, filters) = conv(X, FEATURE_BATCH_SIZE, NUM_FEATURE_BATCHES, DATA_BATCH_SIZE, CUDA_CONVNET, symmetric_relu=False)
-
+    time1 = time.time()
+    (XFinal, filters) = conv(X, FEATURE_BATCH_SIZE, NUM_FEATURE_BATCHES, DATA_BATCH_SIZE, CUDA_CONVNET, symmetric_relu=True)
+    time2 = time.time()
+    print 'Convolutions with {0} filters took {1} seconds'.format(NUM_FEATURE_BATCHES*FEATURE_BATCH_SIZE, (time2-time1))
     XFinalTrain = XFinal[:50000,:,:,:].reshape(NUM_TRAIN,-1)
     XFinalTest = XFinal[50000:,:,:,:].reshape(NUM_TEST,-1)
-
     print "Output train data shape ", XFinalTrain.shape
     print "Output test data shape ", XFinalTest.shape
     print "Output filters shape ", filters.shape
-
     convTrainAcc, convTestAcc = trainAndEvaluatePrimalModel(XFinalTrain, XFinalTest, labelsTrain, labelsTest)
     print "(conv) train: ", convTrainAcc, "(conv) test: ", convTestAcc
+    '''
+
+    featurizeTrainAndEvaluateDualModel(XTrain, XTest, labelsTrain, labelsTest, num_feature_batches=NUM_FEATURE_BATCHES, solve_every_iter=NUM_FEATURE_BATCHES)
+
+    '''
+
+
+    '''
 
