@@ -294,14 +294,19 @@ def featurizeTrainAndEvaluateDualModel(XTrain, XTest, labelsTrain, labelsTest, f
             print "(dual conv #{batchNo}) train: , {convTrainAcc}, (dual conv batch #{batchNo}) test: {convTestAcc}".format(batchNo=i, convTrainAcc=train_acc, convTestAcc=test_acc)
     return train_acc, test_acc
 
-def featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTest, filter_gen, num_feature_batches=1, solve_every_iter=1, regs=[0.1], pool_size=14, FEATURE_BATCH_SIZE=1024, CUDA_CONVNET=True, DATA_BATCH_SIZE=1280):
+def featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTest, filter_gen, solve=False, num_feature_batches=1, solve_every_iter=1, regs=[0.1], pool_size=14, FEATURE_BATCH_SIZE=1024, CUDA_CONVNET=True, DATA_BATCH_SIZE=1280):
     print("RELOADING MOTHER FUCKER 3")
     X = np.vstack((XTrain, XTest))
     parent, child = Pipe()
     XBatchShared = sa.create("shm://xbatch", (X.shape[0],FEATURE_BATCH_SIZE*8), dtype='float32')
-    p = Process(target=accumulateGramAndSolveAsync, args=(child,XTrain.shape[0], XTest.shape[0], regs, labelsTrain, labelsTest))
+    trainKernelShared = sa.create("shm://trainKernel", (XTrain.shape[0], XTrain.shape[0]), dtype='float32')
+    testKernelShared = sa.create("shm://testKernel", (XTest.shape[0], XTrain.shape[0]), dtype='float32')
+
+    trainKernelLocal = np.zeros((XTrain.shape[0], XTrain.shape[0]))
+    testKernelLocal = np.zeros((XTest.shape[0], XTrain.shape[0]))
+
+    p = Process(target=accumulateGramAndSolveAsync, args=(child,XTrain.shape[0], XTest.shape[0], regs, labelsTrain, labelsTest, solve))
     p.start()
-    child.close()
     try:
         for i in range(1, (num_feature_batches + 1)):
             print("Convolving features")
@@ -315,21 +320,34 @@ def featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTe
             parent.send(i)
             time2 = time.time()
             print 'Sending features took {0} seconds'.format((time2-time1))
-        print("CLOSING CONNECTION")
-        sa.delete("shm://xbatch")
         parent.send(-1)
+        child.recv()
+        print("Receiving kernel from child")
+        np.copyto(trainKernelLocal, trainKernelShared)
+        np.copyto(testKernelLocal, testKernelShared)
         parent.close()
+        child.close()
+        sa.delete("shm://xbatch")
+        sa.delete("shm://trainKernel")
+        sa.delete("shm://testKernel")
+        return trainKernelLocal, testKernelLocal
     except (KeyboardInterrupt, SystemExit):
         sa.delete("shm://xbatch")
+        sa.delete("shm://trainKernel")
+        sa.delete("shm://testKernel")
         parent.send(-1)
         parent.close()
+        child.close()
         raise
 
 
-def accumulateGramAndSolveAsync(pipe, numTrain, numTest, regs, labelsTrain, labelsTest):
+def accumulateGramAndSolveAsync(pipe, numTrain, numTest, regs, labelsTrain, labelsTest, solve=False):
     trainKernel = np.zeros((numTrain, numTrain), dtype='float32')
     testKernel= np.zeros((numTest, numTrain), dtype='float32')
     XBatchShared = sa.attach("shm://xbatch")
+    trainKernelShared = sa.attach("shm://trainKernel")
+    testKernelShared = sa.attach("shm://testKernel")
+
     # Local copy
     XBatchLocal = np.zeros(XBatchShared.shape, dtype='float32')
     print("CHILD Process Spun")
@@ -353,23 +371,25 @@ def accumulateGramAndSolveAsync(pipe, numTrain, numTest, regs, labelsTrain, labe
         testKernel += XBatchTest.dot(XBatchTrain.T)
         time2 = time.time()
         print 'Accumulating (ASYNC) Batch {1} gram took {0} seconds'.format((time2-time1), m)
+
     train_accs = []
     test_accs = []
-    for reg in regs:
-        time1 = time.time()
-        print 'learningDual (ASYNC) reg: {reg}'.format(reg=reg)
-        model = learnDual(trainKernel, labelsTrain, reg, TOT_FEAT=TOT_FEAT, NUM_TRAIN=labelsTrain.shape[0])
-        time2 = time.time()
-        print 'learningDual (ASYNC) reg: {reg} took {0} seconds'.format((time2-time1), reg=reg)
-        predTrainLabels = evaluateDualModel(trainKernel, model, TOT_FEAT=TOT_FEAT)
-        predTestLabels = evaluateDualModel(testKernel, model, TOT_FEAT=TOT_FEAT)
-        print("true shape " + str(labelsTrain.shape))
-        print("pred shape " + str(predTrainLabels.shape))
-        train_acc = metrics.accuracy_score(labelsTrain, predTrainLabels)
-        test_acc = metrics.accuracy_score(labelsTest, predTestLabels)
-        print "(async dual conv reg: {reg}) train: , {convTrainAcc}, (dual conv batch) test: {convTestAcc}".format(convTrainAcc=train_acc, convTestAcc=test_acc, reg=reg)
-        train_accs.append(train_acc)
-        test_accs.append(test_acc)
+    if (solve):
+        for reg in regs:
+            time1 = time.time()
+            print 'learningDual (ASYNC) reg: {reg}'.format(reg=reg)
+            model = learnDual(trainKernel, labelsTrain, reg, TOT_FEAT=TOT_FEAT, NUM_TRAIN=labelsTrain.shape[0])
+            time2 = time.time()
+            print 'learningDual (ASYNC) reg: {reg} took {0} seconds'.format((time2-time1), reg=reg)
+            predTrainLabels = evaluateDualModel(trainKernel, model, TOT_FEAT=TOT_FEAT)
+            predTestLabels = evaluateDualModel(testKernel, model, TOT_FEAT=TOT_FEAT)
+            print("true shape " + str(labelsTrain.shape))
+            print("pred shape " + str(predTrainLabels.shape))
+            train_acc = metrics.accuracy_score(labelsTrain, predTrainLabels)
+            test_acc = metrics.accuracy_score(labelsTest, predTestLabels)
+            print "(async dual conv reg: {reg}) train: , {convTrainAcc}, (dual conv batch) test: {convTestAcc}".format(convTrainAcc=train_acc, convTestAcc=test_acc, reg=reg)
+            train_accs.append(train_acc)
+            test_accs.append(test_acc)
     return train_accs, test_accs
 
 
