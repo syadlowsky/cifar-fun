@@ -11,8 +11,8 @@ from theano import function, config, shared, sandbox
 from theano.sandbox.cuda.basic_ops import gpu_contiguous
 import theano.tensor as T
 
-# from pylearn2.sandbox.cuda_convnet.filter_acts import FilterActs
-# from pylearn2.sandbox.cuda_convnet.pool import MaxPool, AvgPool
+from pylearn2.sandbox.cuda_convnet.filter_acts import FilterActs
+from pylearn2.sandbox.cuda_convnet.pool import MaxPool, AvgPool
 
 import numpy as np
 import scipy.linalg
@@ -312,6 +312,12 @@ def featurizeTrainAndEvaluateDualModelAsync(
     print("RELOADING MOTHER FUCKER 3")
     X = np.vstack((XTrain, XTest))
     parent, child = Pipe()
+    try:
+        sa.delete("shm://xbatch")
+        sa.delete("shm://trainKernel")
+        sa.delete("shm://testKernel")
+    except:
+        pass
     XBatchShared = sa.create("shm://xbatch", (X.shape[0],FEATURE_BATCH_SIZE*8), dtype='float32')
     trainKernelShared = sa.create("shm://trainKernel", (XTrain.shape[0], XTrain.shape[0]), dtype='float32')
     testKernelShared = sa.create("shm://testKernel", (XTest.shape[0], XTrain.shape[0]), dtype='float32')
@@ -579,6 +585,7 @@ if __name__ == "__main__":
     np.random.seed(10)
     (XTrain, labelsTrain), (XTest, labelsTest), _ \
         = load_dataset(args.dataset_dir)
+    (XTrain, XTest) = preprocess(XTrain, XTest)
     patches = patchify_all_imgs(XTrain, (6,6), pad=False)
     if FILTER_GEN == 'gaussian':
         filter_gen = make_gaussian_filter_gen(1.0)
