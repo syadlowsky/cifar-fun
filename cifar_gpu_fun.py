@@ -1,60 +1,65 @@
-from theano import function, config, shared, sandbox
-import theano.tensor as T
-from pylearn2.sandbox.cuda_convnet.filter_acts import FilterActs
-from pylearn2.sandbox.cuda_convnet.pool import MaxPool, AvgPool
-from theano.sandbox.cuda.basic_ops import gpu_contiguous
-from multiprocessing import Pipe
-import multiprocessing as mp
-from six.moves import cPickle
+import time
 import logging
 import math
+import os
+import argparse
+
+import multiprocessing as mp
+from multiprocessing import Process, Queue, Pipe
+
+from theano import function, config, shared, sandbox
+from theano.sandbox.cuda.basic_ops import gpu_contiguous
+import theano.tensor as T
+
+# from pylearn2.sandbox.cuda_convnet.filter_acts import FilterActs
+# from pylearn2.sandbox.cuda_convnet.pool import MaxPool, AvgPool
+
 import numpy as np
 import scipy.linalg
-from sklearn import metrics
-import time
-from multiprocessing import Process, Queue
-import numpy as np
 import SharedArray as sa
-from sklearn.metrics import accuracy_score
+
+from sklearn import metrics
 
 #WARNING FOR AVERAGE POOLING THIS RELIES ON THIS FORK OF PYLEARN2:
 # https://github.com/Vaishaal/pylearn2
 
 #logging.getLogger('theano.gof.cmodule').setLevel(logging.DEBUG)
 
-def unpickle(infile):
-    import cPickle
-    fo = open(infile, 'rb')
-    outdict = cPickle.load(fo)
-    fo.close()
-    return outdict
+from proto import data_pb2
 
-def load_cifar_processed():
-    npzfile = np.load("./cifar_processed")
-    return (npzfile['XTrain'], npzfile['yTrain']), (npzfile['XTest'], npzfile['yTest'])
+def load_dataset(base_dir):
+    train_filename = os.path.join(base_dir, 'train.binaryproto')
+    test_filename = os.path.join(base_dir, 'train.binaryproto')
 
-def load_cifar(center=False):
-    train_batches = []
-    train_labels = []
-    for i in range(1,6):
-        cifar_out = unpickle("../cifar/data_batch_{0}".format(i))
-        train_batches.append(cifar_out["data"])
-        train_labels.extend(cifar_out["labels"])
+    def load_from_binaryproto(filename):
+        X = []
+        y = []
+        dataset = data_pb2.Data()
+        with open(filename, 'rb') as f:
+            dataset.ParseFromString(f.read())
+        for datum in dataset.entry:
+            image = np.frombuffer(datum.data, dtype=np.float32) \
+                      .reshape(datum.channels, datum.height, datum.width)
+            X.append(image)
+            y.append(datum.label.ordinal_label)
+        return np.array(X), np.array(y).astype(np.int32)
 
-    # Stupid bull shit to get pixels in correct order
-    X_train= np.vstack(tuple(train_batches)).reshape(-1, 32*32, 3)
-    X_train = X_train.reshape(-1,3,32,32)
-    mean_image = np.mean(X_train, axis=0)[np.newaxis, :, :]
-    y_train = np.array(train_labels)
-    cifar_out = unpickle("../cifar/test_batch")
-    X_test = cifar_out["data"].reshape(-1, 32*32, 3)
-    X_test = X_test.reshape(-1,3,32,32)
-    X_train = X_train
-    X_test = X_test
-    y_test = cifar_out["labels"]
-    return (X_train, np.array(y_train)), (X_test, np.array(y_test))
+    # We can now download and read the training and test set images and labels.
+    X_train, y_train = load_from_binaryproto(train_filename)
+    X_test, y_test = load_from_binaryproto(test_filename)
 
-def conv(data, filter_gen, feature_batch_size, num_feature_batches, data_batch_size, cuda_convnet=True, symmetric_relu=True, start_feature_batch=0, pool_type='avg', pool_size=14, pad=0, bias=1.0, ps=6):
+    # We reserve the last 10000 training examples for validation.
+    X_train, X_val = X_train[:-10000], X_train[-10000:]
+    y_train, y_val = y_train[:-10000], y_train[-10000:]
+
+    # We just return all the arrays in order, as expected in main().
+    # (It doesn't matter how we do this as long as we can read them again.)
+    return (X_train, y_train), (X_val, y_val), (X_test, y_test)
+
+def conv(data, filter_gen, feature_batch_size, num_feature_batches,
+         data_batch_size, cuda_convnet=True, symmetric_relu=True,
+         start_feature_batch=0, pool_type='avg', pool_size=14, pad=0, bias=1.0,
+         ps=6):
     outX = int(math.ceil((data.shape[2] - ps + 1)/float(pool_size)))
     outY = int(math.ceil((data.shape[3] - ps + 1)/float(pool_size)))
     outFilters = feature_batch_size*num_feature_batches
@@ -252,7 +257,8 @@ def trainAndEvaluateDualModel(XTrain, XTest, labelsTrain, labelsTest, reg=0.1):
     return train_acc, test_acc
 
 
-def trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest, reg=0.1):
+def trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest,
+                                reg=0.1):
     model = learnPrimal(XTrain, labelsTrain, reg=reg)
     predTrainLabels = evaluatePrimalModel(XTrain, model)
     predTestLabels = evaluatePrimalModel(XTest, model)
@@ -262,14 +268,19 @@ def trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest, reg=0.1)
     print metrics.confusion_matrix(labelsTest, predTestLabels)
     return train_acc, test_acc
 
-def featurizeTrainAndEvaluateDualModel(XTrain, XTest, labelsTrain, labelsTest, filter_gen, num_feature_batches=1, solve_every_iter=1, reg=0.1):
+def featurizeTrainAndEvaluateDualModel(XTrain, XTest, labelsTrain, labelsTest,
+                                       filter_gen, num_feature_batches=1,
+                                       solve_every_iter=1, reg=0.1):
     trainKernel = np.zeros((XTrain.shape[0], XTrain.shape[0]),dtype='float32')
     testKernel= np.zeros((XTest.shape[0], XTrain.shape[0]),dtype='float32')
     for i in range(1, (num_feature_batches + 1)):
         X = np.vstack((XTrain, XTest))
         print("Convolving features")
         time1 = time.time()
-        (XBatch, filters) = conv(X, filter_gen, FEATURE_BATCH_SIZE, 1, DATA_BATCH_SIZE, CUDA_CONVNET, symmetric_relu=True, start_feature_batch=i-1, pool_type=POOL_TYPE)
+        (XBatch, filters) = conv(X, filter_gen, FEATURE_BATCH_SIZE, 1,
+                                 DATA_BATCH_SIZE, CUDA_CONVNET,
+                                 symmetric_relu=True, start_feature_batch=i-1,
+                                 pool_type=POOL_TYPE)
         time2 = time.time()
         print 'Convolving features took {0} seconds'.format((time2-time1))
         XBatchTrain = XBatch[:50000,:,:,:].reshape(NUM_TRAIN,-1)
@@ -294,7 +305,10 @@ def featurizeTrainAndEvaluateDualModel(XTrain, XTest, labelsTrain, labelsTest, f
             print "(dual conv #{batchNo}) train: , {convTrainAcc}, (dual conv batch #{batchNo}) test: {convTestAcc}".format(batchNo=i, convTrainAcc=train_acc, convTestAcc=test_acc)
     return train_acc, test_acc
 
-def featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTest, filter_gen, solve=False, num_feature_batches=1, solve_every_iter=1, regs=[0.1], pool_size=14, FEATURE_BATCH_SIZE=1024, CUDA_CONVNET=True, DATA_BATCH_SIZE=1280):
+def featurizeTrainAndEvaluateDualModelAsync(
+        XTrain, XTest, labelsTrain, labelsTest, filter_gen, solve=False,
+        num_feature_batches=1, solve_every_iter=1, regs=[0.1], pool_size=14,
+        FEATURE_BATCH_SIZE=1024, CUDA_CONVNET=True, DATA_BATCH_SIZE=1280):
     print("RELOADING MOTHER FUCKER 3")
     X = np.vstack((XTrain, XTest))
     parent, child = Pipe()
@@ -305,13 +319,18 @@ def featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTe
     trainKernelLocal = np.zeros((XTrain.shape[0], XTrain.shape[0]))
     testKernelLocal = np.zeros((XTest.shape[0], XTrain.shape[0]))
 
-    p = Process(target=accumulateGramAndSolveAsync, args=(child,XTrain.shape[0], XTest.shape[0], regs, labelsTrain, labelsTest, solve))
+    p = Process(target=accumulateGramAndSolveAsync,
+                args=(child,XTrain.shape[0], XTest.shape[0], regs, labelsTrain,
+                      labelsTest, solve))
     p.start()
     try:
         for i in range(1, (num_feature_batches + 1)):
             print("Convolving features")
             time1 = time.time()
-            (XBatch, filters) = conv(X, filter_gen, FEATURE_BATCH_SIZE, 1, DATA_BATCH_SIZE, CUDA_CONVNET, symmetric_relu=True, start_feature_batch=i-1, pool_size=pool_size)
+            (XBatch, filters) = conv(
+                X, filter_gen, FEATURE_BATCH_SIZE, 1, DATA_BATCH_SIZE,
+                CUDA_CONVNET, symmetric_relu=True, start_feature_batch=i-1,
+                pool_size=pool_size)
             time2 = time.time()
             print 'Convolving features took {0} seconds'.format((time2-time1))
             print("Sending features")
@@ -341,7 +360,8 @@ def featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTe
         raise
 
 
-def accumulateGramAndSolveAsync(pipe, numTrain, numTest, regs, labelsTrain, labelsTest, solve=False):
+def accumulateGramAndSolveAsync(
+        pipe, numTrain, numTest, regs, labelsTrain, labelsTest, solve=False):
     trainKernel = np.zeros((numTrain, numTrain), dtype='float32')
     testKernel= np.zeros((numTest, numTrain), dtype='float32')
     XBatchShared = sa.attach("shm://xbatch")
@@ -378,11 +398,14 @@ def accumulateGramAndSolveAsync(pipe, numTrain, numTest, regs, labelsTrain, labe
         for reg in regs:
             time1 = time.time()
             print 'learningDual (ASYNC) reg: {reg}'.format(reg=reg)
-            model = learnDual(trainKernel, labelsTrain, reg, TOT_FEAT=TOT_FEAT, NUM_TRAIN=labelsTrain.shape[0])
+            model = learnDual(trainKernel, labelsTrain, reg, TOT_FEAT=TOT_FEAT,
+                              NUM_TRAIN=labelsTrain.shape[0])
             time2 = time.time()
             print 'learningDual (ASYNC) reg: {reg} took {0} seconds'.format((time2-time1), reg=reg)
-            predTrainLabels = evaluateDualModel(trainKernel, model, TOT_FEAT=TOT_FEAT)
-            predTestLabels = evaluateDualModel(testKernel, model, TOT_FEAT=TOT_FEAT)
+            predTrainLabels = evaluateDualModel(
+                trainKernel, model, TOT_FEAT=TOT_FEAT)
+            predTestLabels = evaluateDualModel(
+                testKernel, model, TOT_FEAT=TOT_FEAT)
             print("true shape " + str(labelsTrain.shape))
             print("pred shape " + str(predTrainLabels.shape))
             train_acc = metrics.accuracy_score(labelsTrain, predTrainLabels)
@@ -391,7 +414,6 @@ def accumulateGramAndSolveAsync(pipe, numTrain, numTest, regs, labelsTrain, labe
             train_accs.append(train_acc)
             test_accs.append(test_acc)
     return train_accs, test_accs
-
 
 
 def patchify_all_imgs(X, patch_shape, pad=True, pad_mode='constant', cval=0):
@@ -430,8 +452,10 @@ def patchify(img, patch_shape, pad=True, pad_mode='constant', cval=0):
     return patches
 
 def make_empirical_filter_gen(patches, labels, MIN_VAR_TOL=0):
-    patches = patches.reshape(patches.shape[0]*patches.shape[1],*patches.shape[2:])
-    all_idxs = np.random.choice(patches.shape[0], patches.shape[0], replace=False)
+    patches = patches.reshape(patches.shape[0]*patches.shape[1],
+                              *patches.shape[2:])
+    all_idxs = np.random.choice(patches.shape[0], patches.shape[0],
+                                replace=False)
     curr_idx = [0]
     def empirical_filter_gen(num_filters):
         idxs = all_idxs[curr_idx[0]:curr_idx[0]+num_filters]
@@ -451,14 +475,17 @@ def make_balanced_empirical_filter_gen(patches, labels):
         filters = []
         for c in range(NUM_CLASSES):
             patch_ss = patches[np.where(labels == c)]
-            patch_ss = patch_ss.reshape(patch_ss.shape[0]*patch_ss.shape[1], *patch_ss.shape[2:])
-            idxs = np.random.choice(patch_ss.shape[0], num_filters/NUM_CLASSES, replace=False)
+            patch_ss = patch_ss.reshape(patch_ss.shape[0]*patch_ss.shape[1],
+                                        *patch_ss.shape[2:])
+            idxs = np.random.choice(patch_ss.shape[0], num_filters/NUM_CLASSES,
+                                    replace=False)
             unfiltered = patch_ss[idxs].astype('float32').transpose(0,3,1,2)
             old_shape = unfiltered.shape
             unfiltered = unfiltered.reshape(unfiltered.shape[0], -1)
             unfiltered_vars = np.var(unfiltered, axis=1)
             filtered = unfiltered[np.where(unfiltered_vars > MIN_VAR_TOL)]
-            out = filtered[:num_filters].reshape(num_filters/NUM_CLASSES, *old_shape[1:])
+            out = filtered[:num_filters].reshape(num_filters/NUM_CLASSES,
+                                                 *old_shape[1:])
             filters.append(out)
         return np.concatenate(filters, axis=0)
     return empirical_filter_gen
@@ -470,26 +497,31 @@ def estimate_bandwidth(patches):
 def make_gaussian_filter_gen(bandwidth, patch_size=6, channels=3):
     ps = patch_size
     def gaussian_filter_gen(num_filters):
-        out = np.random.randn(num_filters, channels, ps, ps).astype('float32') * bandwidth
+        out = np.random.randn(
+            num_filters, channels, ps, ps).astype('float32') * bandwidth
         print out.shape
         return out
     return gaussian_filter_gen
 
 def make_gaussian_cov_filter_gen(patches, sub_sample=100000):
-    patches = patches.reshape(patches.shape[0]*patches.shape[1],*patches.shape[2:])
+    patches = patches.reshape(patches.shape[0]*patches.shape[1],
+                              *patches.shape[2:])
     idxs = np.random.choice(patches.shape[0], sub_sample, replace=False)
     patches = patches[idxs, :, :, :]
     patches = patches.reshape(patches.shape[0], -1)
     means = patches.mean(axis=0)[:,np.newaxis]
-    covMatrix = 1.0/(patches.shape[0]) * patches.T.dot(patches) - means.dot(means.T)
+    covMatrix = 1.0/(patches.shape[0]) \
+                * patches.T.dot(patches) - means.dot(means.T)
     covMatrixRoot = np.linalg.cholesky(covMatrix).astype('float32')
     print(covMatrixRoot.shape)
     def gaussian_filter_gen(num_filters):
-        out = np.random.randn(num_filters, 3*6*6).astype('float32').dot(covMatrixRoot)
+        out = np.random.randn(num_filters, 3*6*6).astype(
+            'float32').dot(covMatrixRoot)
         return out.reshape(out.shape[0], 3, 6, 6)
     return gaussian_filter_gen
 
-def make_gaussian_cc_cov_filter_gen(patches, labels, patch_size=6, channels=3, sub_samples=10000):
+def make_gaussian_cc_cov_filter_gen(patches, labels, patch_size=6, channels=3,
+                                    sub_samples=10000):
     ''' NUM_FILTERS MUST BE DIVISBLE BY NUM_CLASSES '''
     covMatrixRoots = []
     bws = []
@@ -501,7 +533,8 @@ def make_gaussian_cc_cov_filter_gen(patches, labels, patch_size=6, channels=3, s
         idxs = np.random.choice(patch_ss.shape[0], sub_samples, replace=False)
         patch_ss = patch_ss.reshape(patch_ss.shape[0], -1)
         means = patch_ss.mean(axis=0)[:,np.newaxis]
-        covMatrix = 1.0/(patch_ss.shape[0]) * (patch_ss.T.dot(patch_ss) - means.dot(means.T))
+        covMatrix = 1.0/(patch_ss.shape[0]) \
+                    * (patch_ss.T.dot(patch_ss) - means.dot(means.T))
         #covMatrix =  1.0  * np.eye(patch_ss.shape[1]) * 10.0/bw
         covMatrixRoot = np.linalg.cholesky(covMatrix).astype('float32')
         covMatrixRoots.append(covMatrixRoot)
@@ -510,18 +543,21 @@ def make_gaussian_cc_cov_filter_gen(patches, labels, patch_size=6, channels=3, s
         ps = patch_size
         filters = []
         for c in range(NUM_CLASSES):
-            out = np.random.randn(num_filters/NUM_CLASSES, channels*ps*ps).astype('float32').dot(covMatrixRoots[c])
+            out = np.random.randn(
+                num_filters/NUM_CLASSES, channels*ps*ps).astype(
+                    'float32').dot(covMatrixRoots[c])
             filters.append(out.reshape(out.shape[0], channels, ps, ps))
         return np.concatenate(filters, axis=0)
     return gaussian_filter_gen
 
 
-
-
-
-
-
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description='Train simple deep nets with robust optimization objective.')
+    parser.add_argument('--dataset_dir', default="",
+                        type=str, help="Path to folder in which test and train protos can be found")
+
+    args = parser.parse_args()
     # Load CIFAR
 
     NUM_FEATURE_BATCHES=512
@@ -534,14 +570,15 @@ if __name__ == "__main__":
     FILTER_GEN ='empirical'
     BANDWIDTH = 1.0
     LAMBDAS = [1e-1/FEATURE_BATCH_SIZE, 1e-2/FEATURE_BATCH_SIZE, 1e-3/FEATURE_BATCH_SIZE, 1e-4/FEATURE_BATCH_SIZE, 1e-5/FEATURE_BATCH_SIZE]
-    CUDA_CONVNET = True
+    CUDA_CONVNET = False
     SCALE = 55.0
     BIAS = 1.25
     MIN_VAR_TOL = 1e-4
     TOT_FEAT = FEATURE_BATCH_SIZE*NUM_FEATURE_BATCHES
 
     np.random.seed(10)
-    (XTrain, labelsTrain), (XTest, labelsTest) = load_cifar_processed()
+    (XTrain, labelsTrain), (XTest, labelsTest), _ \
+        = load_dataset(args.dataset_dir)
     patches = patchify_all_imgs(XTrain, (6,6), pad=False)
     if FILTER_GEN == 'gaussian':
         filter_gen = make_gaussian_filter_gen(1.0)
@@ -583,6 +620,3 @@ if __name__ == "__main__":
     print("STARTING LEVEL 2")
     '''
     featurizeTrainAndEvaluateDualModelAsync(XTrain, XTest, labelsTrain, labelsTest, filter_gen, num_feature_batches=NUM_FEATURE_BATCHES, solve_every_iter=NUM_FEATURE_BATCHES/4, regs=LAMBDAS)
-
-
-
