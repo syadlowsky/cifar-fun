@@ -15,6 +15,7 @@ from pylearn2.sandbox.cuda_convnet.filter_acts import FilterActs
 from pylearn2.sandbox.cuda_convnet.pool import MaxPool, AvgPool
 
 import numpy as np
+from numpy.random import rand as nprand
 import scipy.linalg
 import SharedArray as sa
 
@@ -68,7 +69,7 @@ def conv(data, filter_gen, feature_batch_size, num_feature_batches,
         outFilters = 2*outFilters
 
     print "Out Shape ", outX, "x", outY, "x", outFilters
-    XFinal = np.zeros((data.shape[0], outFilters, outX, outY), 'float32')
+    XFinal = nprand(data.shape[0], outFilters, outX, outY).astype(np.float32)
     filters = []
     numImages = data.shape[0]
     # Convert to cuda-convnet order
@@ -100,7 +101,6 @@ def conv(data, filter_gen, feature_batch_size, num_feature_batches,
             CHANNEL_AXIS = 0
 
         filters.append(F)
-        FTheano = shared(F.astype('float32'))
 
         start_filters = j*feature_batch_size
         end_filters = (j+1)*feature_batch_size
@@ -113,37 +113,6 @@ def conv(data, filter_gen, feature_batch_size, num_feature_batches,
                 start = i*data_batch_size
                 end = min((i+1)*data_batch_size, numImages)
                 print "FEATURE BATCH #", (j + start_feature_batch), "DATA BATCH #", i,  " SIZE IS ", end - start
-                if (cuda_convnet):
-                    XBlock = shared(data[:, :, :, start:end])
-                else:
-                    XBlock = shared(data[start:end, :, :, :])
-
-                if (cuda_convnet):
-                    XBlock_gpu = gpu_contiguous(XBlock)
-                    FTheano_gpu = gpu_contiguous(FTheano)
-
-                # CONV
-                XBlock_conv_out = conv_op(XBlock_gpu, FTheano_gpu)
-
-                # RELU
-                XBlock0 = T.nnet.relu(XBlock_conv_out - bias, 0)
-                if (symmetric_relu):
-                    XBlock1 = T.nnet.relu(-1.0 * XBlock_conv_out - bias, 0)
-
-                XBlock0 = pool_op(XBlock0)
-                if (symmetric_relu):
-                    XBlock1 = pool_op(XBlock1)
-                    XBlockOut = np.concatenate((XBlock0.eval(), XBlock1.eval()), axis=CHANNEL_AXIS)
-                else:
-                    XBlockOut = np.array(XBlock0.eval())
-
-                if (cuda_convnet):
-                    XBlockOut = XBlockOut.transpose(3,0,1,2)
-                    F = F.transpose(3,0,1,2)
-
-                XBlock.set_value([[[[]]]])
-                XFinal[start:end,start_filters:end_filters,:,:] = XBlockOut
-        FTheano.set_value([[[[]]]])
 
     filters = np.concatenate(filters,axis=0)
     return (XFinal, filters)
@@ -197,115 +166,6 @@ def preprocess(train, test, min_divisor=1e-8, zca_bias=0.1):
 
     return (train.reshape(origTrainShape), test.reshape(origTestShape))
 
-def learnPrimal(trainData, labels, reg=0.1):
-    '''Learn a model from trainData -> labels '''
-
-    trainData = trainData.reshape(trainData.shape[0],-1)
-
-    X = np.ascontiguousarray(trainData, dtype=np.float32).reshape(trainData.shape[0], -1)
-    print "X SHAPE ", trainData.shape
-    print "Computing XTX"
-    XTX = X.T.dot(X)
-    print "Done Computing XTX"
-
-    print "REG is " + str(reg)
-    idxes = np.diag_indices(XTX.shape[0])
-    XTX[idxes] += reg
-
-    y = np.eye(max(labels) + 1)[labels]
-    XTy = X.T.dot(y)
-
-    print "Learning Primal Model"
-    model = scipy.linalg.solve(XTX, XTy)
-    return model
-
-def learnDual(gramMatrix, labels, reg=0.1, TOT_FEAT=1, NUM_TRAIN=1):
-    ''' Learn a model from K matrix -> labels '''
-    print ("Learning Dual Model")
-    y = np.eye(max(labels) + 1)[labels]
-    idxes = np.diag_indices(gramMatrix.shape[0])
-    gramMatrix /= float(TOT_FEAT)
-    gramMatrix[idxes] += (NUM_TRAIN * reg)
-    model = scipy.linalg.solve(gramMatrix + NUM_TRAIN * reg * np.eye(gramMatrix.shape[0]), y)
-    gramMatrix[idxes] -= (NUM_TRAIN * reg)
-    gramMatrix *= TOT_FEAT
-    return model
-
-def evaluatePrimalModel(data, model):
-    data = data.reshape(data.shape[0],-1)
-    yHat = np.argmax(data.dot(model), axis=1)
-    return yHat
-
-
-def evaluateDualModel(kMatrix, model, TOT_FEAT=1):
-    print("MODEL SHAPE " + str(model.shape))
-    print("KERNEL SHAPE " + str(kMatrix.shape))
-    kMatrix *= TOT_FEAT
-    y = kMatrix.dot(model)
-    kMatrix /= TOT_FEAT
-    print("pred SHAPE " + str(y.shape))
-    yHat = np.argmax(y, axis=1)
-    return yHat
-
-def trainAndEvaluateDualModel(XTrain, XTest, labelsTrain, labelsTest, reg=0.1):
-    K = XTrain.dot(XTrain.T)
-    KTest = XTest.dot(XTrain)
-    model = learnDual(K,labelsTrain, reg=reg)
-    predTrainLabels = evaluateDualModel(K, model)
-    predTestLabels = evaluateDualModel(KTest, model)
-    train_acc = metrics.accuracy_score(labelsTrain, predTrainLabels)
-    test_acc = metrics.accuracy_score(labelsTest, predTestLabels)
-    return train_acc, test_acc
-
-
-def trainAndEvaluatePrimalModel(XTrain, XTest, labelsTrain, labelsTest,
-                                reg=0.1):
-    model = learnPrimal(XTrain, labelsTrain, reg=reg)
-    predTrainLabels = evaluatePrimalModel(XTrain, model)
-    predTestLabels = evaluatePrimalModel(XTest, model)
-    train_acc = metrics.accuracy_score(labelsTrain, predTrainLabels)
-    test_acc = metrics.accuracy_score(labelsTest, predTestLabels)
-    print "CONFUSION MATRIX"
-    print metrics.confusion_matrix(labelsTest, predTestLabels)
-    return train_acc, test_acc
-
-def featurizeTrainAndEvaluateDualModel(XTrain, XTest, labelsTrain, labelsTest,
-                                       filter_gen, num_feature_batches=1,
-                                       solve_every_iter=1, reg=0.1):
-    n_train = XTrain.shape[0]
-    trainKernel = np.zeros((XTrain.shape[0], XTrain.shape[0]),dtype='float32')
-    testKernel= np.zeros((XTest.shape[0], XTrain.shape[0]),dtype='float32')
-    for i in range(1, (num_feature_batches + 1)):
-        X = np.vstack((XTrain, XTest))
-        print("Convolving features")
-        time1 = time.time()
-        (XBatch, filters) = conv(X, filter_gen, FEATURE_BATCH_SIZE, 1,
-                                 DATA_BATCH_SIZE, CUDA_CONVNET,
-                                 symmetric_relu=True, start_feature_batch=i-1,
-                                 pool_type=POOL_TYPE)
-        time2 = time.time()
-        print 'Convolving features took {0} seconds'.format((time2-time1))
-        XBatchTrain = XBatch[:n_train,:,:,:].reshape(n_train,-1)
-        XBatchTest = XBatch[n_train:,:,:,:].reshape(n_train,-1)
-        print("Accumulating Gram")
-        time1 = time.time()
-        trainKernel += XBatchTrain.dot(XBatchTrain.T)
-        testKernel += XBatchTest.dot(XBatchTrain.T)
-        time2 = time.time()
-        print 'Accumulating gram took {0} seconds'.format((time2-time1))
-        if ((i % solve_every_iter == 0) or i == num_feature_batches - 1):
-            time1 = time.time()
-            model = learnDual(trainKernel, labelsTrain, reg)
-            time2 = time.time()
-            print 'learningDual took {0} seconds'.format((time2-time1))
-            predTrainLabels = evaluateDualModel(trainKernel, model)
-            predTestLabels = evaluateDualModel(testKernel, model)
-            print("true shape " + str(labelsTrain.shape))
-            print("pred shape " + str(predTrainLabels.shape))
-            train_acc = metrics.accuracy_score(labelsTrain, predTrainLabels)
-            test_acc = metrics.accuracy_score(labelsTest, predTestLabels)
-            print "(dual conv #{batchNo}) train: , {convTrainAcc}, (dual conv batch #{batchNo}) test: {convTestAcc}".format(batchNo=i, convTrainAcc=train_acc, convTestAcc=test_acc)
-    return train_acc, test_acc
 
 def featurizeTrainAndEvaluateDualModelAsync(
         XTrain, XTest, labelsTrain, labelsTest, filter_gen, solve=False,
@@ -417,29 +277,7 @@ def accumulateGramAndSolveAsync(
         print 'Accumulating (ASYNC) Batch {1} gram took {0} seconds'.format((time2-time1), m)
 
     finish_lock.release()
-    print "foo"
-    train_accs = []
-    test_accs = []
-    if (solve):
-        for reg in regs:
-            time1 = time.time()
-            print 'learningDual (ASYNC) reg: {reg}'.format(reg=reg)
-            model = learnDual(trainKernel, labelsTrain, reg, TOT_FEAT=TOT_FEAT,
-                              NUM_TRAIN=labelsTrain.shape[0])
-            time2 = time.time()
-            print 'learningDual (ASYNC) reg: {reg} took {0} seconds'.format((time2-time1), reg=reg)
-            predTrainLabels = evaluateDualModel(
-                trainKernel, model, TOT_FEAT=TOT_FEAT)
-            predTestLabels = evaluateDualModel(
-                testKernel, model, TOT_FEAT=TOT_FEAT)
-            print("true shape " + str(labelsTrain.shape))
-            print("pred shape " + str(predTrainLabels.shape))
-            train_acc = metrics.accuracy_score(labelsTrain, predTrainLabels)
-            test_acc = metrics.accuracy_score(labelsTest, predTestLabels)
-            print "(async dual conv reg: {reg}) train: , {convTrainAcc}, (dual conv batch) test: {convTestAcc}".format(convTrainAcc=train_acc, convTestAcc=test_acc, reg=reg)
-            train_accs.append(train_acc)
-            test_accs.append(test_acc)
-    return train_accs, test_accs
+    return None
 
 
 def patchify_all_imgs(X, patch_shape, pad=True, pad_mode='constant', cval=0):
@@ -495,88 +333,6 @@ def make_empirical_filter_gen(patches, labels, MIN_VAR_TOL=0):
         return out
     return empirical_filter_gen
 
-def make_balanced_empirical_filter_gen(patches, labels):
-    ''' NUM_FILTERS MUST BE DIVISIBLE BY NUM_CLASSES '''
-    def empirical_filter_gen(num_filters):
-        filters = []
-        for c in range(NUM_CLASSES):
-            patch_ss = patches[np.where(labels == c)]
-            patch_ss = patch_ss.reshape(patch_ss.shape[0]*patch_ss.shape[1],
-                                        *patch_ss.shape[2:])
-            idxs = np.random.choice(patch_ss.shape[0], num_filters/NUM_CLASSES,
-                                    replace=False)
-            unfiltered = patch_ss[idxs].astype('float32').transpose(0,3,1,2)
-            old_shape = unfiltered.shape
-            unfiltered = unfiltered.reshape(unfiltered.shape[0], -1)
-            unfiltered_vars = np.var(unfiltered, axis=1)
-            filtered = unfiltered[np.where(unfiltered_vars > MIN_VAR_TOL)]
-            out = filtered[:num_filters].reshape(num_filters/NUM_CLASSES,
-                                                 *old_shape[1:])
-            filters.append(out)
-        return np.concatenate(filters, axis=0)
-    return empirical_filter_gen
-
-def estimate_bandwidth(patches):
-    patch_norms = np.linalg.norm(patches.reshape(patches.shape[0], -1), axis=1)
-    return np.median(patch_norms)
-
-def make_gaussian_filter_gen(bandwidth, patch_size=6, channels=3):
-    ps = patch_size
-    def gaussian_filter_gen(num_filters):
-        out = np.random.randn(
-            num_filters, channels, ps, ps).astype('float32') * bandwidth
-        print out.shape
-        return out
-    return gaussian_filter_gen
-
-def make_gaussian_cov_filter_gen(patches, sub_sample=100000):
-    patches = patches.reshape(patches.shape[0]*patches.shape[1],
-                              *patches.shape[2:])
-    idxs = np.random.choice(patches.shape[0], sub_sample, replace=False)
-    patches = patches[idxs, :, :, :]
-    patches = patches.reshape(patches.shape[0], -1)
-    means = patches.mean(axis=0)[:,np.newaxis]
-    covMatrix = 1.0/(patches.shape[0]) \
-                * patches.T.dot(patches) - means.dot(means.T)
-    covMatrixRoot = np.linalg.cholesky(covMatrix).astype('float32')
-    print(covMatrixRoot.shape)
-    def gaussian_filter_gen(num_filters):
-        out = np.random.randn(num_filters, 3*6*6).astype(
-            'float32').dot(covMatrixRoot)
-        return out.reshape(out.shape[0], 3, 6, 6)
-    return gaussian_filter_gen
-
-def make_gaussian_cc_cov_filter_gen(patches, labels, patch_size=6, channels=3,
-                                    sub_samples=10000):
-    ''' NUM_FILTERS MUST BE DIVISBLE BY NUM_CLASSES '''
-    covMatrixRoots = []
-    bws = []
-    for c in range(NUM_CLASSES):
-        patch_ss = patches[np.where(labels == c)]
-        patch_ss = patch_ss.reshape(patch_ss.shape[0]*patch_ss.shape[1], *patch_ss.shape[2:])
-        bw = estimate_bandwidth(patch_ss)
-        bws.append(bw)
-        idxs = np.random.choice(patch_ss.shape[0], sub_samples, replace=False)
-        patch_ss = patch_ss.reshape(patch_ss.shape[0], -1)
-        means = patch_ss.mean(axis=0)[:,np.newaxis]
-        covMatrix = 1.0/(patch_ss.shape[0]) \
-                    * (patch_ss.T.dot(patch_ss) - means.dot(means.T))
-        #covMatrix =  1.0  * np.eye(patch_ss.shape[1]) * 10.0/bw
-        covMatrixRoot = np.linalg.cholesky(covMatrix).astype('float32')
-        covMatrixRoots.append(covMatrixRoot)
-
-    def gaussian_filter_gen(num_filters):
-        ps = patch_size
-        filters = []
-        for c in range(NUM_CLASSES):
-            out = np.random.randn(
-                num_filters/NUM_CLASSES, channels*ps*ps).astype(
-                    'float32').dot(covMatrixRoots[c])
-            filters.append(out.reshape(out.shape[0], channels, ps, ps))
-        return np.concatenate(filters, axis=0)
-    return gaussian_filter_gen
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='Train simple deep nets with robust optimization objective.')
@@ -586,7 +342,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     # Load CIFAR
 
-    NUM_FEATURE_BATCHES=200
+    NUM_FEATURE_BATCHES=300
     DATA_BATCH_SIZE=(1280)
     FEATURE_BATCH_SIZE=(1024)
     NUM_CLASSES = 10
@@ -608,25 +364,11 @@ if __name__ == "__main__":
     XTrain = np.vstack((XTrain, XVal))
     labelsTrain = np.concatenate((labelsTrain, labelsVal))
 
-    XTrain, XPatch = XTrain[:-5000], XTrain[-5000:]
-    labelsTrain, labelsPatch = labelsTrain[:-5000], labelsTrain[-5000:]
     (XTrain, XTest) = preprocess(XTrain, XTest)
-    (XPatch, _) = preprocess(XPatch, XTest)
-    patches = patchify_all_imgs(XPatch, (6,6), pad=False)
-    if FILTER_GEN == 'gaussian':
-        filter_gen = make_gaussian_filter_gen(1.0)
-    elif FILTER_GEN == 'empirical':
-        filter_gen = make_empirical_filter_gen(patches, labelsTrain)
-    elif FILTER_GEN == 'empirical_balanced':
-        filter_gen = make_balanced_empirical_filter_gen(patches, labelsTrain)
-    elif FILTER_GEN == 'gaussian_cov':
-        filter_gen = make_gaussian_cov_filter_gen(patches)
-    elif FILTER_GEN == 'gaussian_cc_cov':
-        filter_gen = make_gaussian_cc_cov_filter_gen(patches, labelsTrain)
-    else:
-        raise Exception('Unknown FILTER_GEN value')
+    patches = patchify_all_imgs(XTrain, (6,6), pad=False)
+    filter_gen = make_empirical_filter_gen(patches, labelsTrain)
 
     featurizeTrainAndEvaluateDualModelAsync(
 	XTrain, XTest, labelsTrain, labelsTest, filter_gen,
 	num_feature_batches=NUM_FEATURE_BATCHES,
-        solve_every_iter=NUM_FEATURE_BATCHES/4, regs=LAMBDAS, solve=True)
+        solve_every_iter=NUM_FEATURE_BATCHES/4, regs=LAMBDAS, solve=False)
